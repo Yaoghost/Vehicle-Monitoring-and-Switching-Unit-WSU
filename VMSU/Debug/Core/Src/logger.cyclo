@@ -1,0 +1,4 @@
+../Core/Src/logger.c:18:12:file_is_empty	1
+../Core/Src/logger.c:23:9:logger_init	14
+../Core/Src/logger.c:73:9:logger_task	11
+../Core/Src/logger.c:120:9:logger_close	4

@@ -18,12 +18,18 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "fatfs.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "string.h"
+#include "logger.h"
 #include "stdio.h"
+#include <math.h>
 #include <inttypes.h>
+#include <stdbool.h>
+#include <stdint.h>
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -38,6 +44,8 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
+#define WINDOW 10
+
 
 /* USER CODE END PM */
 
@@ -45,11 +53,36 @@
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
+SPI_HandleTypeDef hspi2;
+
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-uint32_t value_adc_coolant;
+static logger_t g_logger;
+
+uint16_t values_adc[2];
+float oil_pressure;
+float coolant_temp;
+float coolant_voltage;
+float pressure_voltage;
+
+// --- Nextion RX parser (expects: 'S' '0-2' '=' + 4-byte little endian val) ---
+static uint8_t nx_rx_byte;
+
+typedef enum {
+  NX_WAIT_S,
+  NX_WAIT_ID,
+  NX_WAIT_EQ,
+  NX_VAL0,
+  NX_VAL1,
+  NX_VAL2,
+  NX_VAL3
+} NX_State_t;
+
+static NX_State_t nx_state = NX_WAIT_S;
+static uint8_t nx_switch_id = 0;
+static uint32_t nx_val = 0;
 
 
 /* USER CODE END PV */
@@ -61,21 +94,189 @@ static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_ADC1_Init(void);
+static void MX_SPI2_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+#define SIG1_GPIO_Port GPIOB
+#define SIG1_Pin       GPIO_PIN_3
+
+#define SIG2_GPIO_Port GPIOB
+#define SIG2_Pin       GPIO_PIN_4
+
+#define SIG3_GPIO_Port GPIOB
+#define SIG3_Pin       GPIO_PIN_5
+
+// ---------------------------------------------
+
+
+static void sd_basic_test(void)
+{
+  DSTATUS st = disk_initialize(0);
+
+  FRESULT r_mount, r_open, r_write, r_sync, r_close;
+  FIL file;
+  UINT bw = 0;
+
+  r_mount = f_mount(&USERFatFS, (TCHAR const*)USERPath, 1);
+
+  char path[32];
+  sprintf(path, "%s/module.txt", USERPath);   // yields "0:/test.txt"
+
+  r_open  = (r_mount == FR_OK) ? f_open(&file, path, FA_CREATE_ALWAYS | FA_WRITE) : r_mount;
+  r_write = (r_open  == FR_OK) ? f_write(&file, "Hello from STM32!\r\n", 19, &bw) : r_open;
+  r_sync  = (r_open  == FR_OK) ? f_sync(&file) : r_open;
+  r_close = (r_open  == FR_OK) ? f_close(&file) : r_open;
+
+  // Put breakpoint here and inspect:
+  // st, r_mount, r_open, r_write, r_sync, r_close, bw
+  (void)st; (void)r_mount; (void)r_open; (void)r_write; (void)r_sync; (void)r_close;
+}
+
+static void ApplySwitch(uint8_t id, uint32_t v)
+{
+  GPIO_PinState ps = (v ? GPIO_PIN_SET : GPIO_PIN_RESET);
+
+  switch (id)
+  {
+    case 0: HAL_GPIO_WritePin(SIG1_GPIO_Port, SIG1_Pin, ps); break; // S0 -> SIGNAL1
+    case 1: HAL_GPIO_WritePin(SIG2_GPIO_Port, SIG2_Pin, ps); break; // S1 -> SIGNAL2
+    case 2: HAL_GPIO_WritePin(SIG3_GPIO_Port, SIG3_Pin, ps); break; // S2 -> SIGNAL3
+    default: break;
+  }
+}
+
+
+static void Nextion_ParseByte(uint8_t b)
+{
+  switch (nx_state)
+  {
+    case NX_WAIT_S:
+      if (b == 'S') nx_state = NX_WAIT_ID;
+      break;
+
+    case NX_WAIT_ID:
+      if (b >= '0' && b <= '2') {
+        nx_switch_id = (uint8_t)(b - '0');
+        nx_state = NX_WAIT_EQ;
+      } else {
+        nx_state = NX_WAIT_S;
+      }
+      break;
+
+    case NX_WAIT_EQ:
+      if (b == '=') {
+        nx_val = 0;
+        nx_state = NX_VAL0;
+      } else {
+        nx_state = NX_WAIT_S;
+      }
+      break;
+
+    case NX_VAL0:
+      nx_val |= ((uint32_t)b << 0);
+      nx_state = NX_VAL1;
+      break;
+
+    case NX_VAL1:
+      nx_val |= ((uint32_t)b << 8);
+      nx_state = NX_VAL2;
+      break;
+
+    case NX_VAL2:
+      nx_val |= ((uint32_t)b << 16);
+      nx_state = NX_VAL3;
+      break;
+
+    case NX_VAL3:
+      nx_val |= ((uint32_t)b << 24);
+
+      // Full message received: Sx= + 4 bytes
+      ApplySwitch(nx_switch_id, nx_val);
+
+      // Reset to look for next message
+      nx_state = NX_WAIT_S;
+      break;
+
+    default:
+      nx_state = NX_WAIT_S;
+      break;
+  }
+}
+
+
+
+
 uint8_t Cmd_End[3] = { 0xFF, 0xFF, 0xFF };
 
-/* --- Function to send string to Nextion --- */
-void NEXTION_SendString(const char *ID, float value) {
+//Function for sending numerical values to the display
+void NEXTION_SendTemp(const char *ID, float value) {
+
+	char buf[50];
+	int len = sprintf(buf, "%s.txt=\"%.2fF\"", ID, value); // 2 decimal precision
+	HAL_UART_Transmit(&huart1, (uint8_t*) buf, len, 1000);
+	HAL_UART_Transmit(&huart1, Cmd_End, 3, 100);
+}
+
+void NEXTION_SendPressure(const char *ID, float value) {
+
 	char buf[50];
 	int len = sprintf(buf, "%s.txt=\"%.2f\"", ID, value); // 2 decimal precision
 	HAL_UART_Transmit(&huart1, (uint8_t*) buf, len, 1000);
 	HAL_UART_Transmit(&huart1, Cmd_End, 3, 100);
 }
+
+//Function for sending strings to the display
+void NEXTION_SendMsg(const char *ID, const char *msg) {
+
+	char buf[50];
+	int len = sprintf(buf, "%s.txt=\"%s\"", ID, msg);
+	HAL_UART_Transmit(&huart1, (uint8_t*) buf, len, 1000);
+	HAL_UART_Transmit(&huart1, Cmd_End, 3, 100);
+}
+
+//Calulates the temperature of the cherokee temperture sensor given the voltage across the sensor.
+float CalculateTemp(float Vin){
+
+	//Voltage divider reference resistor resistance
+	int reference_resistance = 1000;
+
+	float resistance = -1 * reference_resistance * ((Vin) / (Vin - 3.3));
+
+	//Steinhart-hart equation using coefficients derived from FSM. Accurate between 100 and 260 degrees F.
+	float temp = 1 / ( 0.001180677409 + 0.0003505018927*log(resistance) - 0.000001315104928*pow(log(resistance), 3) );
+
+	temp = (temp - 273.15) * 9/5 + 32;
+
+	return temp;
+
+};
+
+//Calulates the pressure of the cherokee oil pressure transduce given the voltage across the sensor.
+float CalculatePressure(float Vin){
+
+	int reference_resistance = 1000;
+	float resistance;
+	float pressure;
+
+	//TODO: Fix everything, change formula to include overages on graph
+	resistance = -1 * reference_resistance * ((Vin) / (Vin - 3.3));
+	pressure = 0.01581472788 * pow(resistance, 2) + 0.006331904355 * resistance - 0.1716084384;
+
+	if(Vin > 0.02){
+
+		return pressure;
+
+	}else{
+
+		return 0;
+
+	}
+};
 /* USER CODE END 0 */
 
 /**
@@ -111,27 +312,149 @@ int main(void)
   MX_USART2_UART_Init();
   MX_USART1_UART_Init();
   MX_ADC1_Init();
+  MX_SPI2_Init();
+  MX_FATFS_Init();
+
+
+
   /* USER CODE BEGIN 2 */
 
-		HAL_ADC_Start_DMA(&hadc1, (uint32_t*)&value_adc_coolant, 1);
+		FRESULT log_init = logger_init(&g_logger, &USERFatFS, USERPath, "log.csv");
+		(void)log_init;
+		// Optional: show result on Nextion if you want
+		// char m[32]; sprintf(m,"log_init=%d",(int)log_init); NEXTION_SendMsg("page1.t1", m);
+
+		HAL_ADC_Start_DMA(&hadc1, (uint32_t*)values_adc, 2);
+		HAL_UART_Receive_IT(&huart1, &nx_rx_byte, 1);
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+float padc = 0;
+float padc_sum = 0;
+float padc_buf[WINDOW] = {0};
+float padc_avg = 0;
 
-		float coolant_voltage;
+float cadc = 0;
+float cadc_sum = 0;
+float cadc_buf[WINDOW] = {0};
+float cadc_avg = 0;
+
+bool init = 0;
+
+int i = 0;
+
+//float cadc_sum = 0;
 
 		while (1) {
 
+			padc = values_adc[1];
+			padc_sum += padc;
+			padc_sum -= padc_buf[i];
+			padc_buf[i] = padc;
 
-			coolant_voltage = value_adc_coolant*(3.3/4096);
+			cadc = values_adc[0];
+			cadc_sum += cadc;
+			cadc_sum -= cadc_buf[i];
+			cadc_buf[i] = cadc;
 
-			HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+			i++;
+			if(i >= WINDOW){
+				i = 0;
+				init = 1;
+			}
 
-			//TODO: we need to convert the voltage to resitance, then to actual temp value using conversion function
-			NEXTION_SendString("page2.t0", coolant_voltage);
-			HAL_Delay(250);
+			//coolant_voltage = values_adc[0] * (3.3 / 4096);
+			if(init == 1){
+
+				padc_avg = padc_sum / WINDOW;
+				cadc_avg = cadc_sum / WINDOW;
+
+				pressure_voltage = padc_avg * (3.3 / 4096);
+				coolant_voltage = cadc_avg * (3.3 / 4096);
+			}else{
+				pressure_voltage = values_adc[1] * (3.3 / 4096);
+				coolant_voltage = values_adc[0] * (3.3 / 4096);
+			}
+
+			/*
+			 Moving average algorithm. Adds latest voltage to sum of values in window, removes oldest,
+			 then adds latest value to window, or buffer
+			 */
+
+			coolant_temp = CalculateTemp(coolant_voltage = values_adc[0] * (3.3 / 4096));
+			oil_pressure = CalculatePressure(pressure_voltage = values_adc[1] * (3.3 / 4096));
+
+
+			//Debug light
+			//HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_3);
+			// HAL_Delay(300);
+
+
+
+
+			if (coolant_temp > 100 && coolant_temp < 212){
+
+				NEXTION_SendTemp("page1.t0", coolant_temp);
+				HAL_Delay(250);
+
+			}else if(coolant_temp < 100){
+
+				NEXTION_SendTemp("page1.t0", coolant_temp);
+				HAL_Delay(250);
+
+			}else if(coolant_temp > 212){
+
+				NEXTION_SendMsg("page1.t0", ">260F");
+				HAL_Delay(250);
+
+			}else{
+
+				NEXTION_SendMsg("page1.t0", "ERROR");
+				HAL_Delay(250);
+
+			}
+
+			//Oil Pressure
+			if (oil_pressure >= 0 && oil_pressure < 87){
+
+				NEXTION_SendPressure("page3.t0", oil_pressure);
+				HAL_Delay(250);
+
+			}else if(oil_pressure < 0){
+
+				NEXTION_SendMsg("page3.t0", "Imploding");
+				HAL_Delay(250);
+
+			}else if(oil_pressure > 87){
+
+				NEXTION_SendMsg("page3.t0", ">87 PSI");
+				HAL_Delay(250);
+
+			}else{
+
+				NEXTION_SendMsg("page3.t0", "ERROR");
+				HAL_Delay(250);
+
+			}
+			/*  functional code
+
+			logger_task(&g_logger,
+			            HAL_GetTick(),
+			            5000UL,
+			            coolant_temp,
+			            oil_pressure,
+			            -1.0f);   // fuel placeholder for now
+
+			*/
+			//test
+			logger_task(&g_logger,
+			            HAL_GetTick(),
+			            0UL,
+			            185.5f,     // fake coolant temp
+			            42.3f,      // fake oil pressure
+			            63.7f);     // fake fuel level
 
     /* USER CODE END WHILE */
 
@@ -209,13 +532,13 @@ static void MX_ADC1_Init(void)
   hadc1.Instance = ADC1;
   hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
-  hadc1.Init.ScanConvMode = DISABLE;
+  hadc1.Init.ScanConvMode = ENABLE;
   hadc1.Init.ContinuousConvMode = ENABLE;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
   hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
   hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.NbrOfConversion = 2;
   hadc1.Init.DMAContinuousRequests = ENABLE;
   hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
@@ -232,9 +555,56 @@ static void MX_ADC1_Init(void)
   {
     Error_Handler();
   }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_1;
+  sConfig.Rank = 2;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE BEGIN ADC1_Init 2 */
 
   /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief SPI2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI2_Init(void)
+{
+
+  /* USER CODE BEGIN SPI2_Init 0 */
+
+  /* USER CODE END SPI2_Init 0 */
+
+  /* USER CODE BEGIN SPI2_Init 1 */
+
+  /* USER CODE END SPI2_Init 1 */
+  /* SPI2 parameter configuration*/
+  hspi2.Instance = SPI2;
+  hspi2.Init.Mode = SPI_MODE_MASTER;
+  hspi2.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi2.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi2.Init.NSS = SPI_NSS_SOFT;
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_256;
+  hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi2.Init.CRCPolynomial = 10;
+  if (HAL_SPI_Init(&hspi2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI2_Init 2 */
+
+  /* USER CODE END SPI2_Init 2 */
 
 }
 
@@ -338,7 +708,8 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3|GPIO_PIN_4|GPIO_PIN_5, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET); // SD CS idle HIGH
 
   /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;
@@ -346,18 +717,30 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : LD2_Pin */
-  GPIO_InitStruct.Pin = LD2_Pin;
+  /*Configure GPIO pins : PB12 PB3 PB4 PB5 */
+  GPIO_InitStruct.Pin = GPIO_PIN_12|GPIO_PIN_3|GPIO_PIN_4|GPIO_PIN_5;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+
+
+    Nextion_ParseByte(nx_rx_byte);
+
+    // Re-arm interrupt to receive next byte
+    HAL_UART_Receive_IT(&huart1, &nx_rx_byte, 1);
+  }
+}
 
 /* USER CODE END 4 */
 

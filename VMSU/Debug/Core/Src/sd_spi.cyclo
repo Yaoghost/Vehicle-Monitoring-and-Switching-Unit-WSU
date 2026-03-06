@@ -1,0 +1,12 @@
+../Core/Src/sd_spi.c:16:20:SD_CS_LOW	1
+../Core/Src/sd_spi.c:17:20:SD_CS_HIGH	1
+../Core/Src/sd_spi.c:21:16:spi_txrx	1
+../Core/Src/sd_spi.c:28:13:spi_clock_dummy	2
+../Core/Src/sd_spi.c:34:16:wait_ready	3
+../Core/Src/sd_spi.c:46:16:recv_data_block	5
+../Core/Src/sd_spi.c:70:16:xmit_data_block	7
+../Core/Src/sd_spi.c:103:16:send_cmd	8
+../Core/Src/sd_spi.c:143:9:sd_spi_get_type	1
+../Core/Src/sd_spi.c:145:13:sd_spi_init	15
+../Core/Src/sd_spi.c:199:13:sd_spi_read_sectors	9
+../Core/Src/sd_spi.c:229:13:sd_spi_write_sectors	11
