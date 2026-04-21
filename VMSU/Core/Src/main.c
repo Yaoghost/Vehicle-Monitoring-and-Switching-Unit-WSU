@@ -25,10 +25,12 @@
 #include "string.h"
 #include "logger.h"
 #include "stdio.h"
+#include "hardware_config.h"
 #include <math.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
+
 
 /* USER CODE END Includes */
 
@@ -61,11 +63,15 @@ UART_HandleTypeDef huart2;
 /* USER CODE BEGIN PV */
 static logger_t g_logger;
 
-uint16_t values_adc[2];
+uint16_t values_adc[4];
 float oil_pressure;
 float coolant_temp;
 float coolant_voltage;
 float pressure_voltage;
+float testres1;
+float fuel_quantity;
+float vsref;
+float vfref;
 
 // --- Nextion RX parser (expects: 'S' '0-2' '=' + 4-byte little endian val) ---
 static uint8_t nx_rx_byte;
@@ -240,42 +246,58 @@ void NEXTION_SendMsg(const char *ID, const char *msg) {
 }
 
 //Calulates the temperature of the cherokee temperture sensor given the voltage across the sensor.
-float CalculateTemp(float Vin){
+float CalculateTemp(float coolant_v){
 
-	//Voltage divider reference resistor resistance
-	int reference_resistance = 1000;
+	float coolant_ohms, coolant_degk, coolant_degf;
 
-	float resistance = -1 * reference_resistance * ((Vin) / (Vin - 3.3));
+	coolant_ohms = -1 * COOLANT_DIVIDER_R_HIGH_OHMS * ((coolant_v) / (coolant_v - 3.3));
 
 	//Steinhart-hart equation using coefficients derived from FSM. Accurate between 100 and 260 degrees F.
-	float temp = 1 / ( 0.001180677409 + 0.0003505018927*log(resistance) - 0.000001315104928*pow(log(resistance), 3) );
+	coolant_degk = 1 / ( 0.001180677409 + 0.0003505018927*log(coolant_ohms) - 0.000001315104928*pow(log(coolant_ohms), 3) );
 
-	temp = (temp - 273.15) * 9/5 + 32;
+	coolant_degf = (coolant_degk - 273.15) * 9/5 + 32;
 
-	return temp;
+	return coolant_degf;
 
 };
 
 //Calulates the pressure of the cherokee oil pressure transduce given the voltage across the sensor.
-float CalculatePressure(float Vin){
+float CalculatePressure(float oilpres_v){
 
-	int reference_resistance = 1000;
-	float resistance;
-	float pressure;
+	//TODO: I had a note here to "Fix everything, change formula to include overages on graph" from SD1.
+	//Not too sure what I meant, Will monitor.
 
-	//TODO: Fix everything, change formula to include overages on graph
-	resistance = -1 * reference_resistance * ((Vin) / (Vin - 3.3));
-	pressure = 0.01581472788 * pow(resistance, 2) + 0.006331904355 * resistance - 0.1716084384;
+	float oilpres_ohms, oilpres_psi;
 
-	if(Vin > 0.02){
+	oilpres_ohms = -1 * OIL_DIVIDER_R_HIGH_OHMS * ((oilpres_v) / (oilpres_v - 3.3));
 
-		return pressure;
+	oilpres_psi = 0.01581472788 * pow(oilpres_ohms, 2) + 0.006331904355 * oilpres_ohms - 0.1716084384;
+
+	if(oilpres_v > 0.02){
+
+		return oilpres_psi;
 
 	}else{
 
 		return 0;
 
 	}
+};
+
+float CalculateFuelQuantity(float sref_v, float fref_v){
+
+	float supply_v, sender_v, sender_ohms;
+
+	//vs is voltage supplied to guage cluster.
+	supply_v = (sref_v * (SUPPLY_DIVIDER_R_HIGH_OHMS + SUPPLY_DIVIDER_R_LOW_OHMS)) / SUPPLY_DIVIDER_R_LOW_OHMS;
+
+	//vf is the voltage drop across the guage cluster that changes due to the resistance of the fuel sender
+	sender_v = (fref_v * (FUEL_DIVIDER_R_HIGH_OHMS + FUEL_DIVIDER_R_LOW_OHMS)) / FUEL_DIVIDER_R_LOW_OHMS;
+
+	sender_ohms = -1 * (sender_v * FUEL_GUAGE_R_OHMS) / (supply_v - sender_v); //dont know why this is negative
+
+	return sender_ohms;
+
 };
 /* USER CODE END 0 */
 
@@ -314,9 +336,6 @@ int main(void)
   MX_ADC1_Init();
   MX_SPI2_Init();
   MX_FATFS_Init();
-
-
-
   /* USER CODE BEGIN 2 */
 
 		FRESULT log_init = logger_init(&g_logger, &USERFatFS, USERPath, "log.csv");
@@ -324,73 +343,35 @@ int main(void)
 		// Optional: show result on Nextion if you want
 		// char m[32]; sprintf(m,"log_init=%d",(int)log_init); NEXTION_SendMsg("page1.t1", m);
 
-		HAL_ADC_Start_DMA(&hadc1, (uint32_t*)values_adc, 2);
+		HAL_ADC_Start_DMA(&hadc1, (uint32_t*)values_adc, 4);
 		HAL_UART_Receive_IT(&huart1, &nx_rx_byte, 1);
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-float padc = 0;
-float padc_sum = 0;
-float padc_buf[WINDOW] = {0};
-float padc_avg = 0;
-
-float cadc = 0;
-float cadc_sum = 0;
-float cadc_buf[WINDOW] = {0};
-float cadc_avg = 0;
-
-bool init = 0;
-
-int i = 0;
 
 //float cadc_sum = 0;
 
 		while (1) {
 
-			padc = values_adc[1];
-			padc_sum += padc;
-			padc_sum -= padc_buf[i];
-			padc_buf[i] = padc;
-
-			cadc = values_adc[0];
-			cadc_sum += cadc;
-			cadc_sum -= cadc_buf[i];
-			cadc_buf[i] = cadc;
-
-			i++;
-			if(i >= WINDOW){
-				i = 0;
-				init = 1;
-			}
-
-			//coolant_voltage = values_adc[0] * (3.3 / 4096);
-			if(init == 1){
-
-				padc_avg = padc_sum / WINDOW;
-				cadc_avg = cadc_sum / WINDOW;
-
-				pressure_voltage = padc_avg * (3.3 / 4096);
-				coolant_voltage = cadc_avg * (3.3 / 4096);
-			}else{
-				pressure_voltage = values_adc[1] * (3.3 / 4096);
-				coolant_voltage = values_adc[0] * (3.3 / 4096);
-			}
-
-			/*
-			 Moving average algorithm. Adds latest voltage to sum of values in window, removes oldest,
-			 then adds latest value to window, or buffer
-			 */
-
-			coolant_temp = CalculateTemp(coolant_voltage = values_adc[0] * (3.3 / 4096));
-			oil_pressure = CalculatePressure(pressure_voltage = values_adc[1] * (3.3 / 4096));
 
 
-			//Debug light
-			//HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_3);
-			// HAL_Delay(300);
 
+			coolant_voltage = values_adc[1] * (3.3 / 4096);
+			pressure_voltage = values_adc[3] * (3.3 / 4096);
+
+			//Fuel and guage refrence voltages do not indicate voltage at respective tap points.
+
+			//quirky issue here...3.3v is not the ref v
+			vfref = values_adc[2] * (3.3 / 4096);
+			vsref = values_adc[0] * (3.3 / 4096);
+
+
+
+			fuel_quantity = CalculateFuelQuantity(vsref, vfref);
+			coolant_temp = CalculateTemp(coolant_voltage);
+			oil_pressure = CalculatePressure(pressure_voltage);
 
 
 
@@ -530,7 +511,7 @@ static void MX_ADC1_Init(void)
   /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
   */
   hadc1.Instance = ADC1;
-  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV8;
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
   hadc1.Init.ScanConvMode = ENABLE;
   hadc1.Init.ContinuousConvMode = ENABLE;
@@ -538,7 +519,7 @@ static void MX_ADC1_Init(void)
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
   hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
   hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-  hadc1.Init.NbrOfConversion = 2;
+  hadc1.Init.NbrOfConversion = 4;
   hadc1.Init.DMAContinuousRequests = ENABLE;
   hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
@@ -548,9 +529,27 @@ static void MX_ADC1_Init(void)
 
   /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
   */
-  sConfig.Channel = ADC_CHANNEL_0;
+  sConfig.Channel = ADC_CHANNEL_6;
   sConfig.Rank = 1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_84CYCLES;
+  sConfig.SamplingTime = ADC_SAMPLETIME_480CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_0;
+  sConfig.Rank = 2;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_4;
+  sConfig.Rank = 3;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -559,7 +558,7 @@ static void MX_ADC1_Init(void)
   /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
   */
   sConfig.Channel = ADC_CHANNEL_1;
-  sConfig.Rank = 2;
+  sConfig.Rank = 4;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -708,8 +707,7 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3|GPIO_PIN_4|GPIO_PIN_5, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET); // SD CS idle HIGH
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12|GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;
@@ -717,8 +715,8 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PB12 PB3 PB4 PB5 */
-  GPIO_InitStruct.Pin = GPIO_PIN_12|GPIO_PIN_3|GPIO_PIN_4|GPIO_PIN_5;
+  /*Configure GPIO pins : PB12 PB4 PB5 PB6 */
+  GPIO_InitStruct.Pin = GPIO_PIN_12|GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;

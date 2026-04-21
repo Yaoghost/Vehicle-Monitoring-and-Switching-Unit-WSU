@@ -64,8 +64,8 @@ all: main-build
 main-build: VMSU_STM32.elf secondary-outputs
 
 # Tool invocations
-VMSU_STM32.elf VMSU_STM32.map: $(OBJS) $(USER_OBJS) C:\Users\Owner\Downloads\VMSU\ 2_4_26\VMSU_STM32\STM32F401RETX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "VMSU_STM32.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"C:\Users\Owner\Downloads\VMSU 2_4_26\VMSU_STM32\STM32F401RETX_FLASH.ld" --specs=nosys.specs -Wl,-Map="VMSU_STM32.map" -Wl,--gc-sections -static -u _printf_float --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+VMSU_STM32.elf VMSU_STM32.map: $(OBJS) $(USER_OBJS) /Users/will/Vehicle-Monitoring-and-Switching-Unit-WSU/VMSU/STM32F401RETX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "VMSU_STM32.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"/Users/will/Vehicle-Monitoring-and-Switching-Unit-WSU/VMSU/STM32F401RETX_FLASH.ld" --specs=nosys.specs -Wl,-Map="VMSU_STM32.map" -Wl,--gc-sections -static -u _printf_float --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 
