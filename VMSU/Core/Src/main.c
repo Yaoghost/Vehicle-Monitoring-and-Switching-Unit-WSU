@@ -13,6 +13,17 @@
  * in the root directory of this software component.
  * If no LICENSE file comes with this software, it is provided AS-IS.
  *
+ *******************************************************************************
+ *
+ * Vehicle Monitoring & Switching Unit
+ * Wichita State University Senior Design Project, Spring 2026
+ *
+ *		Electrical Engineering: Silas Salano
+ *		Computer Engineering: David Koffi, William Dirnbeck
+ *		Programming Team: David Koffi, William Dirnbeck
+ *
+ *VDBL
+ *
  ******************************************************************************
  */
 /* USER CODE END Header */
@@ -62,19 +73,27 @@ UART_HandleTypeDef huart2;
 /* USER CODE BEGIN PV */
 static logger_t g_logger;
 
-uint16_t values_adc[4];
+
+
+uint16_t vref_cal;
+float vsref;
+uint16_t values_adc[5];
+
+//TODO: Test initializing thse at nominal values so the alert screen does not appear on boot-up
 float oil_pressure;
 float coolant_temp;
+float fuel_quantity;
+
 float coolant_voltage;
 float pressure_voltage;
 float testres1;
-float fuel_quantity;
-float vsref;
 float vfref;
+
 
 //ALERT
 bool coolant_alert_active = false;
 bool oil_alert_active = false;
+bool fuel_alert_active = false;
 
 // --- Nextion RX parser (expects: 'S' '0-2' '=' + 4-byte little endian val) ---
 static uint8_t nx_rx_byte;
@@ -121,7 +140,7 @@ static void MX_SPI2_Init(void);
 #define SIG3_Pin       GPIO_PIN_6
 
 // ---------------------------------------------
-
+/*
 
 static void sd_basic_test(void)
 {
@@ -145,6 +164,8 @@ static void sd_basic_test(void)
   // st, r_mount, r_open, r_write, r_sync, r_close, bw
   (void)st; (void)r_mount; (void)r_open; (void)r_write; (void)r_sync; (void)r_close;
 }
+
+*/
 
 static void ApplySwitch(uint8_t id, uint32_t v)
 {
@@ -226,7 +247,7 @@ uint8_t Cmd_End[3] = { 0xFF, 0xFF, 0xFF };
 void NEXTION_SendTemp(const char *ID, float value) {
 
 	char buf[50];
-	int len = sprintf(buf, "%s.txt=\"%.2fF\"", ID, value); // 2 decimal precision
+	int len = sprintf(buf, "%s.txt=\"%.0f F\"", ID, value);
 	HAL_UART_Transmit(&huart1, (uint8_t*) buf, len, 1000);
 	HAL_UART_Transmit(&huart1, Cmd_End, 3, 100);
 }
@@ -234,7 +255,15 @@ void NEXTION_SendTemp(const char *ID, float value) {
 void NEXTION_SendPressure(const char *ID, float value) {
 
 	char buf[50];
-	int len = sprintf(buf, "%s.txt=\"%.2f\"", ID, value); // 2 decimal precision
+	int len = sprintf(buf, "%s.txt=\"%.2f\"", ID, value);
+	HAL_UART_Transmit(&huart1, (uint8_t*) buf, len, 1000);
+	HAL_UART_Transmit(&huart1, Cmd_End, 3, 100);
+}
+
+void NEXTION_SendFuel(const char *ID, float value) {
+
+	char buf[50];
+	int len = sprintf(buf, "%s.txt=\"%.0f\"", ID, value);
 	HAL_UART_Transmit(&huart1, (uint8_t*) buf, len, 1000);
 	HAL_UART_Transmit(&huart1, Cmd_End, 3, 100);
 }
@@ -297,17 +326,23 @@ float CalculatePressure(float oilpres_v){
 
 float CalculateFuelQuantity(float sref_v, float fref_v){
 
-	float supply_v, sender_v, sender_ohms;
+	float supply_v, sender_v, sender_ohms, fuel_quantity;
+
+	//Tuneable offset values
+	float vs_comp = 0.5;
+	float sender_comp = -15;
 
 	//vs is voltage supplied to guage cluster.
-	supply_v = (sref_v * (SUPPLY_DIVIDER_R_HIGH_OHMS + SUPPLY_DIVIDER_R_LOW_OHMS)) / SUPPLY_DIVIDER_R_LOW_OHMS;
+	supply_v = (sref_v * ((SUPPLY_DIVIDER_R_HIGH_OHMS + SUPPLY_DIVIDER_R_LOW_OHMS) / SUPPLY_DIVIDER_R_LOW_OHMS)) + vs_comp;
 
 	//vf is the voltage drop across the guage cluster that changes due to the resistance of the fuel sender
 	sender_v = (fref_v * (FUEL_DIVIDER_R_HIGH_OHMS + FUEL_DIVIDER_R_LOW_OHMS)) / FUEL_DIVIDER_R_LOW_OHMS;
 
-	sender_ohms = -1 * (sender_v * FUEL_GUAGE_R_OHMS) / (supply_v - sender_v); //dont know why this is negative
+	sender_ohms = FUEL_GUAGE_R_OHMS * (sender_v / (supply_v - sender_v));
 
-	return sender_ohms;
+	fuel_quantity = (0.0056 * pow(sender_ohms, 2)) + (-0.7850 * sender_ohms) + 27.2869;
+
+	return fuel_quantity;
 
 	//TODO: actually make this send fuel quantity and not just the resistance
 
@@ -351,12 +386,13 @@ int main(void)
   MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
 
+
 		FRESULT log_init = logger_init(&g_logger, &USERFatFS, USERPath, "log.csv");
 		(void)log_init;
 		// Optional: show result on Nextion if you want
 		// char m[32]; sprintf(m,"log_init=%d",(int)log_init); NEXTION_SendMsg("page1.t1", m);
 
-		HAL_ADC_Start_DMA(&hadc1, (uint32_t*)values_adc, 2);
+		HAL_ADC_Start_DMA(&hadc1, (uint32_t*)values_adc, 5);
 		HAL_UART_Receive_IT(&huart1, &nx_rx_byte, 1);
 
   /* USER CODE END 2 */
@@ -368,22 +404,15 @@ int main(void)
 
 		while (1) {
 
-			coolant_voltage = values_adc[0] * (3.3 / 4095);
-			pressure_voltage = values_adc[1] * (3.3 / 4095);
-
-			//Fuel and guage refrence voltages do not indicate voltage at respective tap points.
-
-			//quirky issue here...3.3v is not the ref v
-			//vfref = values_adc[2] * (3.3 / 4095);
-			//vsref = values_adc[0] * (3.3 / 4095);
-
-
+			//Reading in all sensor ADC values and converting to input voltage.
+			coolant_voltage = values_adc[0] * (3.3f / 4095.0f);
+			pressure_voltage = values_adc[1] * (3.3f / 4095.0f);
+			vfref = values_adc[2] * (3.3f / 4095.0f) ;
+			vsref = values_adc[3] * (3.3f / 4095.0f);
 
 			fuel_quantity = CalculateFuelQuantity(vsref, vfref);
 			coolant_temp = CalculateTemp(coolant_voltage);
 			oil_pressure = CalculatePressure(pressure_voltage);
-
-
 
 			if (coolant_temp < 100)
 			{
@@ -393,6 +422,7 @@ int main(void)
 			        NEXTION_GotoPage("page5");
 			        HAL_Delay(100);
 			        NEXTION_SendMsg("page5.t0", "Coolant < 100F");
+			        NEXTION_SendTemp("page4.t0", coolant_temp);
 			    }
 			}
 			else if (coolant_temp > 212)
@@ -403,14 +433,13 @@ int main(void)
 			        NEXTION_GotoPage("page5");
 			        HAL_Delay(100);
 			        NEXTION_SendMsg("page5.t0", "Coolant > 212F");
+			        NEXTION_SendTemp("page4.t0", coolant_temp);
 			    }
 			}
-
-			//TODO: I changed this from an else() of the previous if() branch and now it is entering this when
-			if (coolant_temp > 100 && coolant_temp < 212)
+			else
 			{
 			    coolant_alert_active = false;
-			    NEXTION_SendTemp("page1.t0", coolant_temp);
+			    NEXTION_SendTemp("page4.t0", coolant_temp);
 			    HAL_Delay(250);
 			}
 
@@ -422,6 +451,7 @@ int main(void)
 			        NEXTION_GotoPage("page5");
 			        HAL_Delay(100);
 			        NEXTION_SendMsg("page5.t0", "Oil Press = 0 PSI");
+			        NEXTION_SendPressure("page3.t0", oil_pressure);
 			    }
 			}
 			else if (oil_pressure > 87)
@@ -432,6 +462,7 @@ int main(void)
 			        NEXTION_GotoPage("page5");
 			        HAL_Delay(100);
 			        NEXTION_SendMsg("page5.t0", "Oil Pressure > 87 PSI");
+			        NEXTION_SendPressure("page3.t0", oil_pressure);
 			    }
 			}
 			else
@@ -440,21 +471,34 @@ int main(void)
 			    NEXTION_SendPressure("page3.t0", oil_pressure);
 			    HAL_Delay(250);
 			}
-			// last change
-			// fuel page needs to be fed
 
+			if (fuel_quantity <= 0)
+			{
+			    if (!fuel_alert_active)
+			    {
+			        fuel_alert_active = true;
+			        NEXTION_GotoPage("page5");
+			        HAL_Delay(100);
+			        NEXTION_SendMsg("page5.t0", "Fuel Low!");
+			    }
+			}
+			else
+			{
+			    fuel_alert_active = false;
+			    NEXTION_SendFuel("page2.t0", fuel_quantity);
+			    HAL_Delay(250);
+			}
 
-			//  functional code
-
+/*
 			logger_task(&g_logger,
 			            HAL_GetTick(),
-			            5000UL,
+			            0UL,
 			            coolant_temp,
 			            oil_pressure,
-			            -1.0f);   // fuel placeholder for now
+			            fuel_quantity);   // fuel placeholder for now
+*/
 
 
-			/* test
 			logger_task(&g_logger,
 			            HAL_GetTick(),
 			            0UL,
@@ -462,7 +506,9 @@ int main(void)
 			            42.3f,      // fake oil pressure
 			            63.7f);     // fake fuel level
 
-			*/
+
+
+			//G--31:11
 
     /* USER CODE END WHILE */
 
@@ -546,7 +592,7 @@ static void MX_ADC1_Init(void)
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
   hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
   hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-  hadc1.Init.NbrOfConversion = 2;
+  hadc1.Init.NbrOfConversion = 5;
   hadc1.Init.DMAContinuousRequests = ENABLE;
   hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
@@ -568,6 +614,34 @@ static void MX_ADC1_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_1;
   sConfig.Rank = 2;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_4;
+  sConfig.Rank = 3;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_6;
+  sConfig.Rank = 4;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_VREFINT;
+  sConfig.Rank = 5;
+  sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -716,7 +790,8 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12|GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET); // SD CS idle HIGH
 
   /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;

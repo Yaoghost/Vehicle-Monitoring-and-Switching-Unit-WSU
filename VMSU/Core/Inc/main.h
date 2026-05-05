@@ -59,8 +59,16 @@ void Error_Handler(void);
 /* Private defines -----------------------------------------------------------*/
 #define B1_Pin GPIO_PIN_13
 #define B1_GPIO_Port GPIOC
+#define Coolant_Pin GPIO_PIN_0
+#define Coolant_GPIO_Port GPIOA
+#define Oil_Pin GPIO_PIN_1
+#define Oil_GPIO_Port GPIOA
 #define USART_TX_Pin GPIO_PIN_2
 #define USART_TX_GPIO_Port GPIOA
+#define Fuel_Pin GPIO_PIN_4
+#define Fuel_GPIO_Port GPIOA
+#define Fuel_Supply_Circuit_Pin GPIO_PIN_6
+#define Fuel_Supply_Circuit_GPIO_Port GPIOA
 #define TMS_Pin GPIO_PIN_13
 #define TMS_GPIO_Port GPIOA
 #define TCK_Pin GPIO_PIN_14
